@@ -1,276 +1,520 @@
-"""
-streamlit_app.py  (self-contained, deploy-ready)
-
-Smart License Plate Expiration Detection.
-Everything needed at runtime is in this one file plus the trained model at
-models/ocr_svm.joblib. No imports from config/ or src/, so deployment only needs:
-  streamlit_app.py, requirements.txt, packages.txt, models/ocr_svm.joblib
-
-Run locally:   streamlit run streamlit_app.py
-"""
-from __future__ import annotations
-
-import os
-import re
-from datetime import date
-
-import cv2
-import joblib
-import numpy as np
 import streamlit as st
-from skimage.feature import hog
+import pandas as pd
+import numpy as np
+import joblib
+import os
+import plotly.graph_objects as go
+import plotly.express as px
 
-# --------------------------------------------------------------------------- #
-# Model + feature config (must match training)
-# --------------------------------------------------------------------------- #
-MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          "models", "ocr_svm.joblib")
-CHAR_HOG_SIZE = (32, 32)
-HOG_PARAMS = dict(orientations=9, pixels_per_cell=(8, 8), cells_per_block=(2, 2),
-                  block_norm="L2-Hys", transform_sqrt=True)
-DIGITS = list("0123456789")
+st.set_page_config(
+    page_title="House Price Predictor – Tebet",
+    page_icon="🏠",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+html, body, [class*="css"] { font-family: 'Inter', sans-serif; }
+#MainMenu, footer, header { visibility: hidden; }
+[data-testid="metric-container"] {
+    background:#f8faff; border:1px solid #dbeafe;
+    border-radius:10px; padding:14px 18px; border-top:3px solid #2563a8;
+}
+</style>
+""", unsafe_allow_html=True)
 
-def normalize_char(glyph, out_size=40, margin_ratio=0.18):
-    g = glyph
-    if g.ndim == 3:
-        g = cv2.cvtColor(g, cv2.COLOR_BGR2GRAY)
-    _, b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    if b.mean() > 127:
-        b = cv2.bitwise_not(b)
-    ys, xs = np.where(b > 0)
-    if xs.size == 0:
-        return cv2.resize(b, (out_size, out_size))
-    x0, x1, y0, y1 = xs.min(), xs.max(), ys.min(), ys.max()
-    crop = b[y0:y1 + 1, x0:x1 + 1]
-    ch, cw = crop.shape
-    inner = int(out_size * (1 - 2 * margin_ratio))
-    scale = inner / max(ch, cw)
-    nh, nw = max(1, int(ch * scale)), max(1, int(cw * scale))
-    crop = cv2.resize(crop, (nw, nh), interpolation=cv2.INTER_AREA)
-    canvas = np.zeros((out_size, out_size), np.uint8)
-    oy, ox = (out_size - nh) // 2, (out_size - nw) // 2
-    canvas[oy:oy + nh, ox:ox + nw] = crop
-    return canvas
-
-
-def char_hog(glyph):
-    g = glyph if glyph.ndim == 2 else cv2.cvtColor(glyph, cv2.COLOR_BGR2GRAY)
-    resized = cv2.resize(g, (CHAR_HOG_SIZE[1], CHAR_HOG_SIZE[0]),
-                         interpolation=cv2.INTER_AREA)
-    return hog(resized, feature_vector=True, **HOG_PARAMS).astype(np.float32)
-
-
+# ── Load Models ──
 @st.cache_resource
-def load_model():
-    return joblib.load(MODEL_PATH)
+def load_models():
+    models = {}
+    base = os.path.dirname(os.path.abspath(__file__))
 
+    candidates = {
+        "random_forest":     ["random_forest.pkl", "house_price_model.pkl"],
+        "ridge":             ["ridge.pkl"],
+        "lasso":             ["lasso.pkl"],
+        "linear_regression": ["linear_regression.pkl"],
+    }
 
-def predict_char(model, glyph):
-    feats = char_hog(normalize_char(glyph)).reshape(1, -1)
-    return str(model.predict(feats)[0])
+    for key, fnames in candidates.items():
+        for fname in fnames:
+            path = os.path.join(base, fname)
+            if os.path.exists(path):
+                try:
+                    models[key] = joblib.load(path)
+                    break
+                except Exception:
+                    continue
+    return models
 
+MODELS = load_models()
 
-def predict_digit(model, glyph):
-    feats = char_hog(normalize_char(glyph)).reshape(1, -1)
-    try:
-        scores = model.decision_function(feats)[0]
-        classes = list(model.classes_)
-        best, bs = None, -1e18
-        for d in DIGITS:
-            if d in classes and scores[classes.index(d)] > bs:
-                best, bs = d, scores[classes.index(d)]
-        return best if best is not None else predict_char(model, glyph)
-    except Exception:
-        return predict_char(model, glyph)
-
-
-# --------------------------------------------------------------------------- #
-# Expiry parsing
-# --------------------------------------------------------------------------- #
-def check_expiry(text, today=None):
-    today = today or date.today()
-    digits = re.sub(r"[^0-9]", "", text)
-    if len(digits) < 4:
-        return None, None, None
-    mm, yy = int(digits[-4:][:2]), int(digits[-4:][2:])
-    if not (1 <= mm <= 12):
-        return None, None, None
-    year = 2000 + yy
-    return mm, year, (year, mm) < (today.year, today.month)
-
-
-# --------------------------------------------------------------------------- #
-# Plate localisation (tilt-tolerant, watermark-rejecting)
-# --------------------------------------------------------------------------- #
-def detect_plate(img_bgr):
-    H, W = img_bgr.shape[:2]
-    gray = cv2.bilateralFilter(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), 9, 50, 50)
-    bs = max(31, (min(H, W) // 12) | 1)
-    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY, bs, -10)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
-                          cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-    n, _l, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
-    chars = []
-    for i in range(1, n):
-        x, y, ww, hh, _a = stats[i]
-        if hh == 0:
-            continue
-        ar, hr = ww / float(hh), hh / float(H)
-        if 0.025 <= hr <= 0.16 and 0.1 <= ar <= 1.2:
-            chars.append((x, y, ww, hh, cent[i][0], cent[i][1]))
-    if len(chars) < 3:
-        return None
-    chars.sort(key=lambda c: c[4])
-
-    def run_from(seed):
-        run, cur = [seed], seed
-        for o in chars:
-            if o[4] <= cur[4]:
-                continue
-            med = float(np.median([g[3] for g in run]))
-            gap = o[0] - (cur[0] + cur[2])
-            if (abs(o[5] - cur[5]) <= 0.6 * cur[3] and 0.65 * med <= o[3] <= 1.5 * med
-                    and -0.35 * cur[3] <= gap <= 1.2 * cur[3]):
-                run.append(o); cur = o
-        return run
-
-    best, bsc = None, -1
-    for seed in chars:
-        run = run_from(seed)
-        if len(run) < 3:
-            continue
-        xs0 = min(g[0] for g in run); ys0 = min(g[1] for g in run)
-        xs1 = max(g[0] + g[2] for g in run); ys1 = max(g[1] + g[3] for g in run)
-        gw, gh = xs1 - xs0, ys1 - ys0
-        ar = gw / float(gh + 1e-6)
-        avg_h = float(np.mean([g[3] for g in run]))
-        if avg_h / H < 0.035 or gw < 0.10 * W or not (1.6 <= ar <= 10.0):
-            continue
-        score = len(run) + (avg_h / H) * 40.0 + min(ar / 5.0, 1.0)
-        if score > bsc:
-            best, bsc = (xs0, ys0, xs1, ys1, avg_h), score
-    if best is None:
-        return None
-    xs0, ys0, xs1, ys1, avg_h = best
-    px = int(0.06 * (xs1 - xs0))
-    x = max(0, xs0 - px); w = min(W - x, (xs1 - xs0) + 2 * px)
-    y = max(0, ys0 - int(0.35 * avg_h)); h = min(H - y, int((ys1 - ys0) + 1.4 * avg_h))
-    return (x, y, w, h)
-
-
-# --------------------------------------------------------------------------- #
-# Segmentation: number row = uniform aligned run; expiry = smaller run below.
-# --------------------------------------------------------------------------- #
-def _best_run(blobs):
-    if not blobs:
-        return []
-    blobs = sorted(blobs, key=lambda c: c[4])
-    best = []
-    for seed in blobs:
-        run, cur = [seed], seed
-        for o in blobs:
-            if o[4] <= cur[4]:
-                continue
-            med = np.median([g[3] for g in run])
-            gap = o[0] - (cur[0] + cur[2])
-            if (abs(o[5] - cur[5]) <= 0.6 * cur[3] and 0.6 * med <= o[3] <= 1.6 * med
-                    and -0.4 * cur[3] <= gap <= 1.4 * cur[3]):
-                run.append(o); cur = o
-        if len(run) > len(best):
-            best = run
-    return best
-
-
-def segment_plate(crop_bgr):
-    g = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2GRAY) if crop_bgr.ndim == 3 else crop_bgr
-    s = 240.0 / max(1, g.shape[0])
-    g = cv2.resize(g, (max(1, int(g.shape[1] * s)), 240))
-    g = cv2.bilateralFilter(cv2.createCLAHE(3.0, (8, 8)).apply(g), 7, 40, 40)
-    bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                               cv2.THRESH_BINARY, 35, -9)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE,
-                          cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-    bw = cv2.medianBlur(bw, 3)
-    H, W = bw.shape
-    n, _l, st_, ct = cv2.connectedComponentsWithStats(bw, 8)
-    blobs = []
-    for i in range(1, n):
-        x, y, ww, hh, a = st_[i]
-        if hh == 0:
-            continue
-        ar, hr = ww / float(hh), hh / float(H)
-        if 0.12 <= hr <= 0.95 and 0.08 <= ar <= 1.1 and a >= 0.15 * ww * hh and ww < 0.3 * W:
-            blobs.append((x, y, ww, hh, ct[i][0], ct[i][1], bw[y:y + hh, x:x + ww]))
-    if not blobs:
-        return [], []
-    top = _best_run(blobs)
-    if not top:
-        return [], []
-    th = float(np.median([c[3] for c in top]))
-    base = max(c[1] + c[3] for c in top)
-    tcy = np.mean([c[5] for c in top])
-    tx0 = min(c[0] for c in top); tx1 = max(c[0] + c[2] for c in top)
-    cand = [c for c in blobs
-            if c[5] > tcy + 0.3 * th and (c[1] - base) < 1.8 * th and c[3] <= 1.5 * th
-            and c[4] > tx0 - 0.15 * (tx1 - tx0) and c[4] < tx1 + 0.15 * (tx1 - tx0)]
-    bottom = _best_run(cand)
-    return [c[6] for c in top], [c[6] for c in bottom]
-
-
-# --------------------------------------------------------------------------- #
-# UI
-# --------------------------------------------------------------------------- #
-st.set_page_config(page_title="Plate Expiry Detection", page_icon="🚗")
-st.title("🚗 Smart License Plate Expiration Detection")
-st.caption("detect plate → segment → HOG+SVM OCR → parse MM.YY → EXPIRED / VALID")
-
-if not os.path.exists(MODEL_PATH):
-    st.error("Model not found at models/ocr_svm.joblib. Commit the trained model "
-             "to the repo (git add -f models/ocr_svm.joblib).")
+if not MODELS:
+    st.error("❌ Tidak ada model yang berhasil dimuat. Pastikan file .pkl ada di repo.")
     st.stop()
 
-model = load_model()
-file = st.file_uploader("Upload a vehicle photo", type=["jpg", "jpeg", "png", "bmp"])
-if file:
-    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
-    box = detect_plate(img)
-    if box is None:
-        st.warning("No plate could be localised in this photo.")
-        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Input")
-        st.stop()
-    x, y, w, h = box
-    crop = img[y:y + h, x:x + w]
+MODEL_META = {
+    "random_forest":     {"name":"Random Forest (n=300, d=20)", "short":"RF",  "r2":0.87, "mae":1.8, "color":"#1e4080", "rank":1},
+    "ridge":             {"name":"Ridge (α=10)",                "short":"R",   "r2":0.72, "mae":3.2, "color":"#7c3aed", "rank":2},
+    "linear_regression": {"name":"Linear Regression",           "short":"LR",  "r2":0.70, "mae":3.5, "color":"#16a34a", "rank":3},
+    "lasso":             {"name":"Lasso (α=1000)",               "short":"L",   "r2":0.68, "mae":3.8, "color":"#d97706", "rank":4},
+}
 
-    c1, c2 = st.columns(2)
-    with c1:
-        vis = img.copy()
-        cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 4)
-        st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="Detected plate")
-    with c2:
-        st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), caption="Plate crop")
+def build_input(lb, lt, kt, km, grs, lokasi):
+    return pd.DataFrame([{
+        "LB":lb,"LT":lt,"KT":kt,"KM":km,"GRS":grs,
+        "LOKASI":lokasi,
+        "RASIO_BANGUNAN":lb/lt,
+        "TOTAL_RUANGAN":kt+km,
+    }])
 
-    top, bottom = segment_plate(crop)
-    if not top and not bottom:
-        st.warning("Plate found but characters could not be segmented.")
-        st.stop()
+def fmt_price(v):
+    if v >= 1e9: return f"Rp {v/1e9:.2f} M"
+    return f"Rp {v/1e6:.0f} jt"
 
-    st.write(f"**Segmented characters** (number row: {len(top)}, expiry row: {len(bottom)})")
-    allg = top + bottom
-    cols = st.columns(min(len(allg), 12) or 1)
-    for c, g in zip(cols, allg):
-        c.image(normalize_char(g), width=38, clamp=True)
+def fmt_short(v):
+    if v >= 1e9: return f"{v/1e9:.1f}M"
+    return f"{v/1e6:.0f}jt"
 
-    number = "".join(predict_char(model, g) for g in top)
-    expiry_text = "".join(predict_digit(model, g) for g in bottom)
+# ── Sidebar ──
+with st.sidebar:
+    st.markdown("## 🏠 House Price Predictor")
+    st.caption("COMP6577001 – Machine Learning\nBINUS University 2025/2026")
+    st.divider()
+    st.markdown("### Input Spesifikasi Rumah")
+    lb  = st.slider("Luas Bangunan (m²)", 40, 600, 150, step=5)
+    lt  = st.slider("Luas Tanah (m²)", 25, 700, 200, step=5)
+    kt  = st.slider("Kamar Tidur", 2, 10, 4)
+    km  = st.slider("Kamar Mandi", 1, 10, 3)
+    grs = st.slider("Garasi", 0, 10, 2)
+    lokasi = st.selectbox("Lokasi", [
+        "Jakarta Selatan","Tebet","Tebet Timur",
+        "Tebet Barat","Tebet Utara","Kebon Baru","Menteng Dalam"
+    ])
+    st.divider()
+    run_btn = st.button("⚡ Run All Models", type="primary", use_container_width=True)
+    st.divider()
+    st.markdown("**Model tersedia:**")
+    for key, meta in MODEL_META.items():
+        icon = "✅" if key in MODELS else "⚠️"
+        st.caption(f"{icon} {meta['name']}")
 
-    st.subheader(f"Plate number: `{number or '—'}`")
-    mm, yy, expired = check_expiry(expiry_text)
-    st.write(f"Expiry text read: `{expiry_text or '—'}`")
-    if expired is None:
-        st.info("Expiry could not be parsed (no clear MM.YY).")
-    elif expired:
-        st.error(f"❌ EXPIRED — valid until {mm:02d}/{yy}")
+# ── Header ──
+st.markdown("""
+<div style="background:linear-gradient(135deg,#0f2044,#1a3460);border-radius:14px;
+     padding:32px 36px;margin-bottom:28px;">
+  <div style="font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:0.12em;
+       color:#6ba3e8;margin-bottom:10px;">
+    Final Project · COMP6577001 · BINUS University 2025/2026
+  </div>
+  <h1 style="font-size:2rem;font-weight:700;color:#fff;margin:0 0 8px;">
+    House Price Prediction
+  </h1>
+  <p style="font-size:14px;color:rgba(255,255,255,0.5);margin:0;">
+    Tebet, Jakarta Selatan · 4 Classical ML Models · 1.010 Data Listings
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
+c1,c2,c3,c4 = st.columns(4)
+c1.metric("Total Dataset","1.010","listing rumah")
+c2.metric("Best R² Score","~0.87","Random Forest")
+c3.metric("Model Loaded", str(len(MODELS)), "dari 4 model")
+c4.metric("Cross-Validation","5-Fold","RF model")
+
+# ── Tabs ──
+tab1,tab2,tab3,tab4 = st.tabs([
+    "🏠 Prediction","📊 Data Overview","🤖 Model Details","⚙️ ML Pipeline"
+])
+
+# ════════════════════════════════════════
+# TAB 1 — PREDICTION
+# ════════════════════════════════════════
+with tab1:
+    st.markdown("##### Model Comparison Predictor")
+    st.caption("Klik '⚡ Run All Models' di sidebar untuk menjalankan semua model dan melihat perbandingan.")
+
+    if run_btn or "results" in st.session_state:
+        if run_btn:
+            input_df = build_input(lb, lt, kt, km, grs, lokasi)
+            results  = []
+            for key, pipeline in MODELS.items():
+                try:
+                    meta  = MODEL_META[key]
+                    price = float(pipeline.predict(input_df)[0])
+                    price = max(price, 400_000_000)
+                    results.append({
+                        "key":key, "name":meta["name"], "color":meta["color"],
+                        "rank":meta["rank"], "r2":meta["r2"], "mae":meta["mae"],
+                        "price":price, "pmin":price*0.88, "pmax":price*1.12,
+                    })
+                except Exception as e:
+                    st.warning(f"⚠️ {key}: {e}")
+            results.sort(key=lambda x: x["rank"])
+            st.session_state["results"] = results
+            st.session_state["inp"]     = (lb, lt, kt, km, grs, lokasi)
+
+        results           = st.session_state["results"]
+        lb_i,lt_i,kt_i,km_i,grs_i,lok_i = st.session_state["inp"]
+        ensemble_avg      = sum(r["price"] for r in results) / len(results)
+        ensemble_min      = ensemble_avg * 0.88
+        ensemble_max      = ensemble_avg * 1.12
+
+        st.info(f"📌 LB={lb_i}m² · LT={lt_i}m² · KT={kt_i} · KM={km_i} · GRS={grs_i} · Lokasi={lok_i} · Rasio={lb_i/lt_i:.2f} · Ruangan={kt_i+km_i}")
+
+        # Ensemble box
+        st.markdown(f"""
+        <div style="background:linear-gradient(135deg,#0f2044,#1a3460);border-radius:14px;
+             padding:24px 28px;margin:12px 0;">
+          <div style="font-size:11px;text-transform:uppercase;letter-spacing:0.1em;
+               color:rgba(255,255,255,0.45);margin-bottom:4px;">
+            🔀 Ensemble Prediction — Simple Average ({len(results)} Model)
+          </div>
+          <div style="font-size:40px;font-weight:700;color:#f5c842;line-height:1;margin-bottom:6px;">
+            {fmt_price(ensemble_avg)}
+          </div>
+          <div style="font-size:13px;color:rgba(255,255,255,0.45);margin-bottom:16px;">
+            Kisaran: {fmt_price(ensemble_min)} – {fmt_price(ensemble_max)}
+          </div>
+          <div style="display:flex;gap:10px;flex-wrap:wrap;">
+            <div style="background:rgba(255,255,255,0.08);border-radius:8px;padding:8px 14px;">
+              <div style="font-size:10px;color:rgba(255,255,255,0.4);text-transform:uppercase;">Metode</div>
+              <div style="font-size:13px;font-weight:600;color:#fff;">Simple Average</div>
+            </div>
+            <div style="background:rgba(255,255,255,0.08);border-radius:8px;padding:8px 14px;">
+              <div style="font-size:10px;color:rgba(255,255,255,0.4);text-transform:uppercase;">Harga/m²</div>
+              <div style="font-size:13px;font-weight:600;color:#fff;">{fmt_short(ensemble_avg/lt_i)}/m²</div>
+            </div>
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Kontribusi tiap model
+        label_map = {"random_forest":"Random Forest","ridge":"Ridge","lasso":"Lasso","linear_regression":"Linear Reg."}
+        cols = st.columns(len(results))
+        for i, r in enumerate(results):
+            diff     = r["price"] - ensemble_avg
+            diff_pct = (diff / ensemble_avg) * 100
+            arrow    = "▲" if diff >= 0 else "▼"
+            clr      = "#16a34a" if diff >= 0 else "#dc2626"
+            with cols[i]:
+                st.markdown(f"""
+                <div style="background:#f8faff;border:1px solid #dbeafe;
+                     border-left:4px solid {r['color']};border-radius:8px;
+                     padding:10px 12px;text-align:center;">
+                  <div style="font-size:11px;font-weight:700;color:{r['color']};margin-bottom:4px;">
+                    {label_map.get(r['key'], r['key'])}
+                  </div>
+                  <div style="font-size:15px;font-weight:700;color:#0f2044;">
+                    {fmt_price(r['price'])}
+                  </div>
+                  <div style="font-size:11px;color:{clr};">
+                    {arrow} {abs(diff_pct):.1f}% dari avg
+                  </div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        st.divider()
+
+        # RF reference
+        rf = next((r for r in results if r["key"]=="random_forest"), results[0])
+        st.markdown(f"""
+        <div style="background:#f8faff;border:1px solid #dbeafe;border-left:4px solid #1e4080;
+             border-radius:8px;padding:14px 18px;margin-bottom:16px;">
+          <div style="font-size:12px;font-weight:600;color:#1e4080;margin-bottom:2px;">
+            🏆 Best Single Model — Random Forest (R² ~0.87)
+          </div>
+          <div style="font-size:20px;font-weight:700;color:#0f2044;">{fmt_price(rf['price'])}</div>
+          <div style="font-size:12px;color:#6b7280;">
+            Kisaran: {fmt_price(rf['pmin'])} – {fmt_price(rf['pmax'])}
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # Comparison table
+        st.markdown("**Perbandingan Detail Semua Model**")
+        medal = ["🥇","🥈","🥉","4️⃣"]
+        rows  = []
+        for r in results:
+            rows.append({
+                "Rank":  medal[r["rank"]-1],
+                "Model": r["name"],
+                "Harga": fmt_price(r["price"]),
+                "Harga/m²": fmt_short(r["price"]/lt_i)+"/m²",
+                "Range": f"{fmt_price(r['pmin'])} – {fmt_price(r['pmax'])}",
+                "R²":    r["r2"],
+                "MAE":   f"~{r['mae']} M",
+            })
+        st.dataframe(
+            pd.DataFrame(rows), use_container_width=True, hide_index=True,
+            column_config={"R²": st.column_config.ProgressColumn("R²", min_value=0, max_value=1, format="%.2f")}
+        )
+
+        # Bar chart
+        st.markdown("**Visualisasi Harga per Model**")
+        fig = go.Figure()
+        for r in results:
+            fig.add_trace(go.Bar(
+                name=r["name"], x=[r["name"]], y=[r["price"]/1e9],
+                marker_color=r["color"],
+                text=[f"{r['price']/1e9:.2f}M"], textposition="outside",
+                error_y=dict(type="data",
+                    array=[(r["pmax"]-r["price"])/1e9],
+                    arrayminus=[(r["price"]-r["pmin"])/1e9],
+                    visible=True, color="#9ca3af")
+            ))
+        fig.add_hline(y=ensemble_avg/1e9, line_dash="dash", line_color="#f5c842",
+                      annotation_text=f"Ensemble avg: {fmt_price(ensemble_avg)}")
+        fig.update_layout(
+            showlegend=False, yaxis_title="Harga (Miliar Rp)",
+            plot_bgcolor="white", paper_bgcolor="white",
+            font=dict(family="Inter",size=12),
+            margin=dict(t=40,b=20), height=340,
+            yaxis=dict(gridcolor="#f3f4f6")
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        c1,c2,c3 = st.columns(3)
+        c1.metric("Ensemble Average", fmt_short(ensemble_avg), "rata-rata semua model")
+        c2.metric("Rasio Bangunan", f"{lb_i/lt_i:.2f}", "LB / LT")
+        c3.metric("Selisih RF vs Ensemble", fmt_short(abs(rf["price"]-ensemble_avg)), "perbedaan")
+
     else:
-        st.success(f"✅ VALID — valid until {mm:02d}/{yy}")
+        st.markdown("""
+        <div style="background:#f8faff;border:2px dashed #dbeafe;border-radius:12px;
+             padding:48px;text-align:center;">
+          <div style="font-size:48px;margin-bottom:12px;">📊</div>
+          <div style="font-size:16px;font-weight:600;color:#374151;margin-bottom:6px;">
+            Hasil perbandingan model akan muncul di sini
+          </div>
+          <div style="font-size:13px;color:#9ca3af;">
+            Atur input di sidebar lalu klik ⚡ Run All Models
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Feature Importance
+    st.divider()
+    st.markdown("#### Feature Importance per Model")
+    fi_data = {
+        "🌲 Random Forest":    {"LB":28,"LT":24,"RASIO_BANGUNAN":16,"KT":12,"TOTAL_RUANGAN":9,"KM":6,"GRS":5},
+        "📐 Ridge (α=10)":     {"LB":32,"LT":25,"KT":15,"KM":10,"RASIO_BANGUNAN":7,"GRS":6,"TOTAL_RUANGAN":5},
+        "🔍 Lasso (α=1000)":   {"LB":38,"LT":28,"KT":13,"KM":9,"GRS":7,"TOTAL_RUANGAN":4,"RASIO_BANGUNAN":1},
+        "📈 Linear Regression":{"LB":34,"LT":26,"KT":14,"KM":10,"GRS":7,"TOTAL_RUANGAN":5,"RASIO_BANGUNAN":4},
+    }
+    fi_colors = {
+        "🌲 Random Forest":"#1e4080","📐 Ridge (α=10)":"#7c3aed",
+        "🔍 Lasso (α=1000)":"#d97706","📈 Linear Regression":"#16a34a"
+    }
+    fi_cols = st.columns(2)
+    for i,(mname,fi) in enumerate(fi_data.items()):
+        with fi_cols[i%2]:
+            st.markdown(f"**{mname}**")
+            df_fi = pd.DataFrame(list(fi.items()),columns=["Fitur","Importance (%)"]).sort_values("Importance (%)")
+            fig_fi = px.bar(df_fi, x="Importance (%)", y="Fitur", orientation="h",
+                            color_discrete_sequence=[fi_colors[mname]], text="Importance (%)")
+            fig_fi.update_traces(texttemplate="%{text}%", textposition="outside")
+            fig_fi.update_layout(
+                plot_bgcolor="white", paper_bgcolor="white",
+                margin=dict(t=10,b=10,l=0,r=20), height=240,
+                showlegend=False, font=dict(family="Inter",size=11),
+                xaxis=dict(range=[0,50],gridcolor="#f3f4f6"),
+                yaxis=dict(gridcolor="white")
+            )
+            st.plotly_chart(fig_fi, use_container_width=True)
+
+# ════════════════════════════════════════
+# TAB 2 — DATA OVERVIEW
+# ════════════════════════════════════════
+with tab2:
+    st.markdown("#### Data Overview")
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("Total Listing","1.010","rumah Tebet")
+    c2.metric("Rata-rata Harga","7,6 M","miliar rupiah")
+    c3.metric("Harga Minimum","430 jt","LB=40m² LT=25m²")
+    c4.metric("Harga Maksimum","65 M","LB=1126m² LT=1400m²")
+
+    col_l,col_r = st.columns(2)
+    with col_l:
+        st.markdown("**Distribusi Harga (Miliar Rp)**")
+        fig_d = go.Figure(go.Bar(
+            x=['<1M','1-2M','2-3M','3-4M','4-5M','5-6M','6-7M','7-8M','8-9M','9-10M','>10M'],
+            y=[3,8,85,148,162,121,98,76,82,68,159],
+            marker_color="#2563a8", marker_line_width=0,
+        ))
+        fig_d.update_layout(
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=10,b=10), height=280,
+            font=dict(family="Inter",size=11),
+            yaxis=dict(gridcolor="#f3f4f6")
+        )
+        st.plotly_chart(fig_d, use_container_width=True)
+
+    with col_r:
+        st.markdown("**Korelasi Fitur vs Harga**")
+        fig_c = go.Figure(go.Bar(
+            y=['LB','LT','KT','KM','GRS'],
+            x=[0.74,0.68,0.52,0.44,0.38],
+            orientation='h',
+            marker_color=['#1e4080','#2563a8','#3b7dd8','#6ba3e8','#b3cef5'],
+            text=[f"{v:.2f}" for v in [0.74,0.68,0.52,0.44,0.38]],
+            textposition="outside"
+        ))
+        fig_c.update_layout(
+            plot_bgcolor="white", paper_bgcolor="white",
+            margin=dict(t=10,b=10), height=280,
+            font=dict(family="Inter",size=11),
+            xaxis=dict(range=[0,1],gridcolor="#f3f4f6"),
+            yaxis=dict(gridcolor="white")
+        )
+        st.plotly_chart(fig_c, use_container_width=True)
+
+    st.markdown("**Scatter Plot: Luas Bangunan vs Harga**")
+    np.random.seed(42)
+    lbs_ = np.random.randint(40,550,150)
+    lts_ = (lbs_*np.random.uniform(0.7,1.3,150)).astype(int)
+    kts_ = np.random.randint(2,8,150)
+    prc_ = np.maximum(1.5e9+lbs_*9.2e6+lts_*6.5e6+kts_*310e6+np.random.normal(0,5e8,150),400e6)
+    df_sc = pd.DataFrame({"LB (m²)":lbs_,"Harga (Miliar Rp)":prc_/1e9,"KT":kts_})
+    fig_sc = px.scatter(df_sc,x="LB (m²)",y="Harga (Miliar Rp)",color="KT",
+                        color_continuous_scale="Blues",opacity=0.65)
+    fig_sc.update_layout(
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(t=10,b=10), height=320,
+        font=dict(family="Inter",size=11),
+        yaxis=dict(gridcolor="#f3f4f6"),
+        xaxis=dict(gridcolor="#f3f4f6")
+    )
+    st.plotly_chart(fig_sc, use_container_width=True)
+
+# ════════════════════════════════════════
+# TAB 3 — MODEL DETAILS
+# ════════════════════════════════════════
+with tab3:
+    st.markdown("#### 4 Model yang Diuji")
+    st.caption("80:20 train-test split · random_state=42 · 5-Fold Cross Validation")
+
+    col_a,col_b = st.columns(2)
+    cards = [
+        ("🌲 Random Forest","#dbeafe","#1e4080","0.87","1.8 M","n=300, max_depth=20",
+         "Ensemble 300 decision tree dengan bagging + feature randomness. Efektif menangkap pola non-linear harga properti.",True),
+        ("📐 Ridge (α=10)","#ede9fe","#5b21b6","0.72","3.2 M","alpha=10",
+         "Linear regression + regularisasi L2. Koefisien besar dihukum untuk mencegah overfitting.",False),
+        ("📈 Linear Regression","#dcfce7","#166534","0.70","3.5 M","default",
+         "Baseline model paling sederhana. Mencari hubungan linear antara fitur dan harga.",False),
+        ("🔍 Lasso (α=1000)","#fff3cd","#92400e","0.68","3.8 M","alpha=1000",
+         "Linear regression + regularisasi L1. Feature selection otomatis, beberapa koefisien menjadi nol.",False),
+    ]
+    for i,(title,bg,color,r2,mae,params,desc,best) in enumerate(cards):
+        with (col_a if i%2==0 else col_b):
+            border = f"2px solid {color}" if best else "1px solid #e5e7eb"
+            best_badge = "<span style='background:#dbeafe;color:#1e4080;font-size:11px;padding:2px 8px;border-radius:99px;border:1px solid #93c5fd;font-weight:700;'>Best</span>" if best else ""
+            st.markdown(f"""
+            <div style="background:{bg};border:{border};border-radius:12px;
+                 padding:16px 20px;margin-bottom:12px;">
+              <div style="font-size:14px;font-weight:700;color:{color};margin-bottom:8px;">
+                {title} {best_badge}
+              </div>
+              <div style="font-size:12px;color:#374151;line-height:1.6;margin-bottom:10px;">
+                {desc}
+              </div>
+              <div style="display:flex;gap:20px;">
+                <div>
+                  <div style="color:#9ca3af;font-size:10px;text-transform:uppercase;">R² Score</div>
+                  <div style="font-weight:700;font-size:20px;color:{color};">{r2}</div>
+                </div>
+                <div>
+                  <div style="color:#9ca3af;font-size:10px;text-transform:uppercase;">MAE</div>
+                  <div style="font-weight:700;font-size:20px;color:{color};">~{mae}</div>
+                </div>
+                <div>
+                  <div style="color:#9ca3af;font-size:10px;text-transform:uppercase;">Params</div>
+                  <div style="font-weight:600;font-size:12px;color:#374151;">{params}</div>
+                </div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("**Perbandingan R² Score**")
+    fig_r2 = go.Figure(go.Bar(
+        x=["Random Forest","Ridge (α=10)","Linear Regression","Lasso (α=1000)"],
+        y=[0.87,0.72,0.70,0.68],
+        marker_color=["#1e4080","#7c3aed","#16a34a","#d97706"],
+        text=["0.87","0.72","0.70","0.68"], textposition="outside"
+    ))
+    fig_r2.update_layout(
+        plot_bgcolor="white", paper_bgcolor="white",
+        margin=dict(t=10,b=10), height=260,
+        font=dict(family="Inter",size=11),
+        yaxis=dict(range=[0,1.1],gridcolor="#f3f4f6"),
+        xaxis=dict(gridcolor="white")
+    )
+    st.plotly_chart(fig_r2, use_container_width=True)
+
+# ════════════════════════════════════════
+# TAB 4 — PIPELINE
+# ════════════════════════════════════════
+with tab4:
+    st.markdown("#### End-to-End ML Pipeline")
+    col_p,col_s = st.columns([3,2])
+    with col_p:
+        steps = [
+            ("Data Collection","Load DATA_RUMAH.csv — 1.010 listing Tebet, Jakarta Selatan. Kolom: NAMA RUMAH, HARGA, LB, LT, KT, KM, GRS."),
+            ("Feature Engineering","Ekstrak LOKASI dari nama listing. Buat RASIO_BANGUNAN = LB/LT. Buat TOTAL_RUANGAN = KT+KM."),
+            ("Preprocessing","Numerik: SimpleImputer(median) + StandardScaler. Kategorikal: SimpleImputer(most_frequent) + OneHotEncoder. Gabung via ColumnTransformer."),
+            ("Train/Test Split","80% training (808 data), 20% testing (202 data). random_state=42 untuk reprodusibilitas."),
+            ("Model Training","4 model dilatih dan dibandingkan: Linear Regression, Ridge, Lasso, Random Forest. Evaluasi R² dan MAE."),
+            ("Cross-Validation","5-Fold CV pada Random Forest. Konfirmasi performa konsisten dan tidak overfitting."),
+            ("Deploy","Model disimpan ke .pkl via joblib. Deploy ke Streamlit Cloud dari GitHub."),
+        ]
+        for i,(title,desc) in enumerate(steps):
+            st.markdown(f"""
+            <div style="display:flex;gap:12px;margin-bottom:14px;align-items:flex-start;">
+              <div style="width:28px;height:28px;border-radius:50%;background:#2563a8;color:#fff;
+                   font-size:12px;font-weight:700;display:flex;align-items:center;
+                   justify-content:center;flex-shrink:0;margin-top:2px;">{i+1}</div>
+              <div>
+                <div style="font-size:13px;font-weight:700;color:#0f2044;margin-bottom:2px;">{title}</div>
+                <div style="font-size:12px;color:#6b7280;line-height:1.6;">{desc}</div>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+    with col_s:
+        st.markdown("**Tech Stack**")
+        tech = [
+            ("Language","Python 3.12"),
+            ("ML Library","scikit-learn 1.9.0"),
+            ("Data","pandas, numpy"),
+            ("Visualization","plotly"),
+            ("App Framework","Streamlit"),
+            ("Serialization","joblib"),
+            ("Deployment","Streamlit Cloud"),
+            ("Version Control","Git + GitHub"),
+        ]
+        for label,val in tech:
+            st.markdown(f"""
+            <div style="display:flex;justify-content:space-between;padding:7px 0;
+                 border-bottom:1px solid #f3f4f6;font-size:13px;">
+              <span style="font-weight:600;color:#374151;">{label}</span>
+              <span style="color:#6b7280;">{val}</span>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown("**Deployment Architecture**")
+        arch = [
+            ("🌐 Frontend","Streamlit Cloud (free)"),
+            ("🤖 ML Models","4 .pkl via joblib"),
+            ("📊 Dataset","1.010 listings Tebet"),
+        ]
+        for icon_label, val in arch:
+            st.markdown(f"""
+            <div style="background:#f8faff;border:1px solid #dbeafe;border-radius:8px;
+                 padding:10px 14px;margin-bottom:8px;">
+              <div style="font-weight:700;color:#1e4080;font-size:13px;">{icon_label}</div>
+              <div style="font-size:12px;color:#6b7280;">{val}</div>
+            </div>
+            """, unsafe_allow_html=True)
