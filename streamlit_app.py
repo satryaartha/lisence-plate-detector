@@ -268,7 +268,13 @@ def segment_plate(crop_bgr):
             cx, cy = float(ct[i][0]), float(ct[i][1])
             if hh == 0:
                 continue
-            if (0.15 <= hh / float(SH) <= 0.98 and 0.05 <= ww / float(hh) <= 1.3
+            ar = ww / float(hh)
+            # reject border lines: too narrow (ar < 0.12) OR touching left/right edge
+            if ar < 0.12:
+                continue
+            if x2 <= 2 or (x2 + ww) >= SW - 2:
+                continue
+            if (0.15 <= hh / float(SH) <= 0.98 and 0.12 <= ar <= 1.3
                     and a >= 0.08 * ww * hh and ww < 0.25 * SW):
                 blobs.append([x2, y2, ww, hh, cx, cy, strip[y2:y2 + hh, x2:x2 + ww]])
         run = _best_run(blobs)
