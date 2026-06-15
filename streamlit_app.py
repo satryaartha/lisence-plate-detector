@@ -150,12 +150,14 @@ def detect_plate(img_bgr):
             ar = gw / float(gh + 1e-6)
             avg_h = float(np.mean([g[3] for g in run]))
             avg_hr = avg_h / H
-            if avg_hr < 0.03 or gw < 0.08 * W or not (1.5 <= ar <= 11.0):
+            # Plate characters are LARGE (>4.5% image height).
+            # Stickers/labels have small chars (<3%) — reject them here.
+            if avg_hr < 0.045 or gw < 0.08 * W or not (1.5 <= ar <= 11.0):
                 continue
-            # prefer runs in the lower 2/3 of the image (plates are low)
+            # Size is the strongest signal: plate chars dwarf sticker chars
             cy_norm = float(np.mean([g[5] for g in run])) / H
-            position_bonus = max(0.0, cy_norm - 0.3) * 10.0
-            score = len(run) + avg_hr * 40.0 + min(ar / 5.0, 1.0) + position_bonus
+            position_bonus = max(0.0, cy_norm - 0.3) * 5.0
+            score = len(run) + avg_hr * 60.0 + min(ar / 5.0, 1.0) + position_bonus
             if score > bsc:
                 best, bsc = (xs0, ys0, xs1, ys1, avg_h), score
         return best, bsc
