@@ -104,56 +104,76 @@ def check_expiry(text, today=None):
 
 
 # --------------------------------------------------------------------------- #
-# Plate localisation (tilt-tolerant, watermark-rejecting)
+# Plate localisation — works on both black-white AND white-red plates,
+# prefers runs in the lower half of the image (where plates usually are),
+# and rejects small-text noise / objects in corners.
 # --------------------------------------------------------------------------- #
 def detect_plate(img_bgr):
     H, W = img_bgr.shape[:2]
+
+    def _find_runs(bw):
+        """Find the best character-run box in a binary image."""
+        n, _l, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
+        chars = []
+        for i in range(1, n):
+            x, y, ww, hh, _a = stats[i]
+            if hh == 0:
+                continue
+            ar, hr = ww / float(hh), hh / float(H)
+            if 0.025 <= hr <= 0.18 and 0.08 <= ar <= 1.3:
+                chars.append((x, y, ww, hh, float(cent[i][0]), float(cent[i][1])))
+        if len(chars) < 3:
+            return None, -1
+        chars.sort(key=lambda c: c[4])
+
+        def run_from(seed):
+            run, cur = [seed], seed
+            for o in chars:
+                if o[4] <= cur[4]:
+                    continue
+                med = float(np.median([g[3] for g in run]))
+                gap = o[0] - (cur[0] + cur[2])
+                if (abs(o[5] - cur[5]) <= 0.65 * cur[3]
+                        and 0.6 * med <= o[3] <= 1.6 * med
+                        and -0.4 * cur[3] <= gap <= 1.3 * cur[3]):
+                    run.append(o); cur = o
+            return run
+
+        best, bsc = None, -1
+        for seed in chars:
+            run = run_from(seed)
+            if len(run) < 3:
+                continue
+            xs0 = min(g[0] for g in run); ys0 = min(g[1] for g in run)
+            xs1 = max(g[0] + g[2] for g in run); ys1 = max(g[1] + g[3] for g in run)
+            gw, gh = xs1 - xs0, ys1 - ys0
+            ar = gw / float(gh + 1e-6)
+            avg_h = float(np.mean([g[3] for g in run]))
+            avg_hr = avg_h / H
+            if avg_hr < 0.03 or gw < 0.08 * W or not (1.5 <= ar <= 11.0):
+                continue
+            # prefer runs in the lower 2/3 of the image (plates are low)
+            cy_norm = float(np.mean([g[5] for g in run])) / H
+            position_bonus = max(0.0, cy_norm - 0.3) * 10.0
+            score = len(run) + avg_hr * 40.0 + min(ar / 5.0, 1.0) + position_bonus
+            if score > bsc:
+                best, bsc = (xs0, ys0, xs1, ys1, avg_h), score
+        return best, bsc
+
+    # Try both polarities: black-white plate (bw1) and white-red plate (bw2)
     gray = cv2.bilateralFilter(cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY), 9, 50, 50)
     bs = max(31, (min(H, W) // 12) | 1)
-    bw = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
-                               cv2.THRESH_BINARY, bs, -10)
-    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
-                          cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
-    n, _l, stats, cent = cv2.connectedComponentsWithStats(bw, 8)
-    chars = []
-    for i in range(1, n):
-        x, y, ww, hh, _a = stats[i]
-        if hh == 0:
-            continue
-        ar, hr = ww / float(hh), hh / float(H)
-        if 0.025 <= hr <= 0.16 and 0.1 <= ar <= 1.2:
-            chars.append((x, y, ww, hh, cent[i][0], cent[i][1]))
-    if len(chars) < 3:
-        return None
-    chars.sort(key=lambda c: c[4])
+    bw1 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY, bs, -10)
+    bw2 = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                cv2.THRESH_BINARY_INV, bs, -10)
+    for bw in (bw1, bw2):
+        bw[:] = cv2.morphologyEx(bw, cv2.MORPH_OPEN,
+                                 cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2)))
 
-    def run_from(seed):
-        run, cur = [seed], seed
-        for o in chars:
-            if o[4] <= cur[4]:
-                continue
-            med = float(np.median([g[3] for g in run]))
-            gap = o[0] - (cur[0] + cur[2])
-            if (abs(o[5] - cur[5]) <= 0.6 * cur[3] and 0.65 * med <= o[3] <= 1.5 * med
-                    and -0.35 * cur[3] <= gap <= 1.2 * cur[3]):
-                run.append(o); cur = o
-        return run
-
-    best, bsc = None, -1
-    for seed in chars:
-        run = run_from(seed)
-        if len(run) < 3:
-            continue
-        xs0 = min(g[0] for g in run); ys0 = min(g[1] for g in run)
-        xs1 = max(g[0] + g[2] for g in run); ys1 = max(g[1] + g[3] for g in run)
-        gw, gh = xs1 - xs0, ys1 - ys0
-        ar = gw / float(gh + 1e-6)
-        avg_h = float(np.mean([g[3] for g in run]))
-        if avg_h / H < 0.035 or gw < 0.10 * W or not (1.6 <= ar <= 10.0):
-            continue
-        score = len(run) + (avg_h / H) * 40.0 + min(ar / 5.0, 1.0)
-        if score > bsc:
-            best, bsc = (xs0, ys0, xs1, ys1, avg_h), score
+    best1, sc1 = _find_runs(bw1)
+    best2, sc2 = _find_runs(bw2)
+    best = best1 if sc1 >= sc2 else best2
     if best is None:
         return None
     xs0, ys0, xs1, ys1, avg_h = best
@@ -239,7 +259,7 @@ def segment_plate(crop_bgr):
     if s0:
         bands.append((s0, H))
     rows_out = []
-    for (r0, r1) in bands[:2]:
+    for (r0, r1) in bands[:3]:  # up to 3 bands; we'll pick the right two
         strip = bw[r0:r1, :]; SH, SW = strip.shape
         n, _l, st, ct = cv2.connectedComponentsWithStats(strip, 8)
         blobs = []
@@ -252,10 +272,19 @@ def segment_plate(crop_bgr):
                     and a >= 0.08 * ww * hh and ww < 0.25 * SW):
                 blobs.append([x2, y2, ww, hh, cx, cy, strip[y2:y2 + hh, x2:x2 + ww]])
         run = _best_run(blobs)
-        if run:
-            rows_out.append([c[6] for c in sorted(run, key=lambda c: c[0])])
-    top    = rows_out[0] if len(rows_out) > 0 else []
-    bottom = rows_out[1] if len(rows_out) > 1 else []
+        if run and len(run) >= 2:
+            med_h = float(np.median([c[3] for c in run]))
+            rows_out.append((r0, med_h, [c[6] for c in sorted(run, key=lambda c: c[0])]))
+
+    if not rows_out:
+        return [], []
+    # number row = the band with the tallest median character height
+    rows_out.sort(key=lambda r: r[1], reverse=True)
+    num_row = rows_out[0]
+    # expiry row = any other band that starts BELOW the number row
+    exp_row = next((r for r in rows_out[1:] if r[0] > num_row[0]), None)
+    top    = num_row[2]
+    bottom = exp_row[2] if exp_row else []
     return top, bottom
 
 
