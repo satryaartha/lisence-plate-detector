@@ -74,18 +74,83 @@ def predict_char(model, glyph):
     return str(model.predict(feats)[0])
 
 
-def predict_digit(model, glyph):
+def _best_in_class(model, glyph, allowed: list[str]) -> str:
+    """Return the highest-scoring prediction restricted to `allowed` characters."""
     feats = char_hog(normalize_char(glyph)).reshape(1, -1)
     try:
         scores = model.decision_function(feats)[0]
         classes = list(model.classes_)
         best, bs = None, -1e18
-        for d in DIGITS:
-            if d in classes and scores[classes.index(d)] > bs:
-                best, bs = d, scores[classes.index(d)]
+        for c in allowed:
+            if c in classes and scores[classes.index(c)] > bs:
+                best, bs = c, scores[classes.index(c)]
         return best if best is not None else predict_char(model, glyph)
     except Exception:
         return predict_char(model, glyph)
+
+
+def predict_digit(model, glyph):
+    return _best_in_class(model, glyph, DIGITS)
+
+
+def predict_letter(model, glyph):
+    letters = [c for c in model.classes_ if c.isalpha()]
+    return _best_in_class(model, glyph, letters)
+
+
+def predict_plate_number(model, glyphs: list) -> str:
+    """
+    Enforce Indonesian plate format: [1-2 huruf][1-4 angka][1-3 huruf]
+    OCR dipaksa membaca huruf di zona huruf, angka di zona angka.
+
+    Deteksi zona dengan membiarkan model bebas dulu, lalu tentukan batas
+    transisi huruf→angka→huruf dari pola prediksi bebas.
+    """
+    if not glyphs:
+        return ""
+    n = len(glyphs)
+
+    # Step 1: free prediction for each glyph
+    free = [predict_char(model, g) for g in glyphs]
+
+    # Step 2: find zone boundaries using the free predictions
+    # Zona 1 (huruf awal): 1-2 char, pasti huruf
+    # Zona 2 (angka): 1-4 digit
+    # Zona 3 (huruf akhir): 1-3 char, pasti huruf
+    # Cari batas terbaik dengan dynamic programming ringan
+    best_parse = None
+    best_score = -1
+
+    for z1 in range(1, 3):          # zona 1: 1-2 huruf
+        for z2 in range(1, 5):      # zona 2: 1-4 angka
+            z3 = n - z1 - z2        # zona 3: sisa = huruf akhir
+            if not (1 <= z3 <= 3):
+                continue
+            # score = berapa banyak free prediction yang sudah sesuai zona
+            sc = 0
+            for i in range(z1):
+                if free[i].isalpha(): sc += 1
+            for i in range(z1, z1 + z2):
+                if free[i].isdigit(): sc += 1
+            for i in range(z1 + z2, n):
+                if free[i].isalpha(): sc += 1
+            if sc > best_score:
+                best_score = sc
+                best_parse = (z1, z2, z3)
+
+    if best_parse is None:
+        # fallback: just return free predictions
+        return "".join(free)
+
+    z1, z2, z3 = best_parse
+    result = []
+    for i in range(z1):
+        result.append(predict_letter(model, glyphs[i]))
+    for i in range(z1, z1 + z2):
+        result.append(predict_digit(model, glyphs[i]))
+    for i in range(z1 + z2, n):
+        result.append(predict_letter(model, glyphs[i]))
+    return "".join(result)
 
 
 # --------------------------------------------------------------------------- #
@@ -434,8 +499,10 @@ if file:
     for c, g in zip(cols, allg):
         c.image(normalize_char(g), width=38, clamp=True)
 
-    number = "".join(predict_char(model, g) for g in top)
-    expiry_text = "".join(predict_digit(model, g) for g in bottom)
+    number = predict_plate_number(model, top)
+    # Expiry: paksa 4 digit (MM YY), ambil 4 pertama kalau lebih
+    exp_glyphs = bottom[:4]
+    expiry_text = "".join(predict_digit(model, g) for g in exp_glyphs)
 
     st.subheader(f"Plate number: `{number or '\u2014'}`")
     mm, yy, expired = check_expiry(expiry_text)
