@@ -366,6 +366,15 @@ def segment_plate(crop_bgr):
 # Segmentation for already-cropped plate images
 # --------------------------------------------------------------------------- #
 def segment_cropped_plate(img_bgr):
+    """
+    Segment BOTH number row and expiry row from a cropped plate image.
+    Returns (num_glyphs, exp_glyphs).
+
+    Key insight: expiry row chars are ~40-60% smaller than number row chars,
+    so their horizontal projection is much lower. We use a HIGH threshold (28%)
+    to find the number row, then a LOW threshold (6%) to find the expiry row
+    strictly below it.
+    """
     g = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY) if img_bgr.ndim == 3 else img_bgr
     H, W = g.shape
     s = 200.0 / H
@@ -376,33 +385,32 @@ def segment_cropped_plate(img_bgr):
     BH, BW = g.shape
     g = cv2.bilateralFilter(cv2.createCLAHE(2.0, (8, 8)).apply(g), 5, 30, 30)
 
-    def _try_seg(bw):
-        bw2 = cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-        hproj = np.convolve(bw2.sum(axis=1).astype(float), np.ones(3) / 3, mode="same")
-        thr = float(hproj.max()) * 0.30
-        bands, s0 = [], None
-        for i in range(BH):
-            v = float(hproj[i])
-            if v > thr and s0 is None: s0 = i
-            elif v <= thr and s0 is not None:
-                if i - s0 > BH * 0.12: bands.append((s0, i))
-                s0 = None
-        if s0: bands.append((s0, BH))
-        if not bands: return []
-        r0, r1 = max(bands, key=lambda b: b[1] - b[0])
-        r0 = max(0, r0 - 2); r1 = min(BH, r1 + 2)
-        strip = bw2[r0:r1, :]; SH, SW = strip.shape
+    def _bw_variants():
+        _, bo = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        ba = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY, 31, -8)
+        ba = cv2.morphologyEx(ba, cv2.MORPH_CLOSE,
+                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
+        ba = cv2.medianBlur(ba, 3)
+        out = []
+        for bw in [bo, cv2.bitwise_not(bo), ba, cv2.bitwise_not(ba)]:
+            out.append(cv2.morphologyEx(bw, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)))
+        return out
+
+    def _extract(bw, band, min_hr=0.25):
+        r0, r1 = band
+        strip = bw[r0:r1, :]; SH, SW = strip.shape
         n, _l, st2, ct = cv2.connectedComponentsWithStats(strip, 8)
         blobs = []
         for i in range(1, n):
-            x2, y2, ww, hh, a = int(st2[i][0]),int(st2[i][1]),int(st2[i][2]),int(st2[i][3]),int(st2[i][4])
-            cx, cy = float(ct[i][0]), float(ct[i][1])
+            x2,y2,ww,hh,a = int(st2[i][0]),int(st2[i][1]),int(st2[i][2]),int(st2[i][3]),int(st2[i][4])
             if hh == 0: continue
             hr, ar = hh / float(SH), ww / float(hh)
-            if hr < 0.35 or hr > 0.99: continue
-            if ar < 0.08 or ar > 1.5: continue
+            if hr < min_hr or hr > 0.99: continue
+            if ar < 0.08 or ar > 1.6: continue
             if a < 0.04 * ww * hh: continue
-            blobs.append([x2, y2, ww, hh, cx, cy, strip[y2:y2+hh, x2:x2+ww]])
+            blobs.append([x2,y2,ww,hh,float(ct[i][0]),float(ct[i][1]),
+                          strip[y2:y2+hh, x2:x2+ww]])
         if not blobs: return []
         blobs.sort(key=lambda c: c[4]); best = []
         for seed in blobs:
@@ -417,21 +425,51 @@ def segment_cropped_plate(img_bgr):
             if len(run) > len(best): best = run
         return [c[6] for c in sorted(best, key=lambda c: c[0])]
 
-    candidates = []
-    _, bw_o = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    for bw in (bw_o, cv2.bitwise_not(bw_o)):
-        r = _try_seg(bw)
-        if r: candidates.append(r)
-    for inv in (False, True):
-        mode = cv2.THRESH_BINARY_INV if inv else cv2.THRESH_BINARY
-        bw = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, mode, 31, -8)
-        bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE,
-                              cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        bw = cv2.medianBlur(bw, 3)
-        r = _try_seg(bw)
-        if r: candidates.append(r)
-    if not candidates: return []
-    return max(candidates, key=lambda c: -abs(len(c) - 7.5))
+    best_num, best_exp = [], []
+    best_num_sc, best_exp_sc = -999, -999
+
+    for bw in _bw_variants():
+        hproj = np.convolve(bw.sum(axis=1).astype(float), np.ones(3) / 3, mode='same')
+        mx_h = float(hproj.max())
+        if mx_h == 0: continue
+
+        # --- Number row: high threshold ---
+        thr1 = mx_h * 0.28
+        bands, s0 = [], None
+        for i in range(BH):
+            v = float(hproj[i])
+            if v > thr1 and s0 is None: s0 = i
+            elif v <= thr1 and s0 is not None:
+                if i - s0 > BH * 0.10: bands.append((s0, i))
+                s0 = None
+        if s0: bands.append((s0, BH))
+        if not bands: continue
+        nb = max(bands, key=lambda b: b[1] - b[0])
+        num = _extract(bw, nb, min_hr=0.30)
+        num_sc = len(num) - abs(len(num) - 7) * 2
+        if num_sc > best_num_sc:
+            best_num_sc = num_sc; best_num = num
+
+        # --- Expiry row: low threshold, strictly below number row ---
+        thr2 = mx_h * 0.06
+        eb_list, s0 = [], None
+        for i in range(nb[1], BH):
+            v = float(hproj[i])
+            if v > thr2 and s0 is None: s0 = i
+            elif v <= thr2 and s0 is not None:
+                if i - s0 > BH * 0.05: eb_list.append((s0, i))
+                s0 = None
+        if s0 and BH - s0 > BH * 0.05: eb_list.append((s0, BH))
+        if not eb_list: continue
+        eb = max(eb_list, key=lambda b: b[1] - b[0])
+        exp = _extract(bw, eb, min_hr=0.20)
+        # expiry should be 3-4 digits; penalise deviation
+        exp_sc = len(exp) - abs(len(exp) - 4) * 3
+        if exp_sc > best_exp_sc:
+            best_exp_sc = exp_sc; best_exp = exp
+
+    # cap expiry at 4 digits
+    return best_num, best_exp[:4]
 
 
 # --------------------------------------------------------------------------- #
@@ -480,12 +518,8 @@ if file:
         st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), caption="Plate crop")
 
     if cropped_mode:
-        top = segment_cropped_plate(crop)
-        # expiry: try lower 45% of the plate
-        lower = crop[int(crop.shape[0] * 0.55):, :]
-        bottom = segment_cropped_plate(lower) if lower.shape[0] > 10 else []
-        if len(bottom) > 6 or len(bottom) < 2:
-            bottom = []
+        top, bottom = segment_cropped_plate(crop)
+        bottom = bottom[:4]  # cap at 4 expiry digits
     else:
         top, bottom = segment_plate(crop)
 
