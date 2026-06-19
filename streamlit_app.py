@@ -219,10 +219,17 @@ def detect_plate(img_bgr):
             # Stickers/labels have small chars (<3%) — reject them here.
             if avg_hr < 0.045 or gw < 0.08 * W or not (1.5 <= ar <= 11.0):
                 continue
-            # Size is the strongest signal: plate chars dwarf sticker chars
+            # The MAIN number row sits in the upper-middle of the plate.
+            # Brand logos (YAMAHA/HONDA) and the expiry row sit at the BOTTOM.
+            # The old code REWARDED low runs (cy_norm - 0.3) which actively
+            # pulled detection onto logos/expiry — that was the core bug.
+            # Now: reward upper-center + wide runs, penalise bottom runs.
             cy_norm = float(np.mean([g[5] for g in run])) / H
-            position_bonus = max(0.0, cy_norm - 0.3) * 5.0
-            score = len(run) + avg_hr * 60.0 + min(ar / 5.0, 1.0) + position_bonus
+            center_bonus   = (1.0 - abs(cy_norm - 0.42)) * 2.0   # peak ~42% height
+            bottom_penalty = max(0.0, cy_norm - 0.60) * 10.0      # kill bottom runs
+            width_bonus    = min(gw / float(W), 1.0) * 2.5        # full-width wins
+            score = (len(run) + avg_hr * 60.0 + min(ar / 5.0, 1.0)
+                     + center_bonus + width_bonus - bottom_penalty)
             if score > bsc:
                 best, bsc = (xs0, ys0, xs1, ys1, avg_h), score
         return best, bsc
@@ -275,6 +282,46 @@ def _deskew(crop_bgr):
     M = cv2.getRotationMatrix2D((W / 2, H / 2), angle, 1.0)
     return cv2.warpAffine(crop_bgr, M, (W, H), flags=cv2.INTER_CUBIC,
                           borderMode=cv2.BORDER_REPLICATE)
+
+
+def _merge_fragments(blobs, strip):
+    """
+    Merge connected-component fragments that belong to the SAME character.
+    Embossed plates frequently break one glyph into vertically-stacked pieces
+    (light catches the raised metal unevenly). Those pieces share an x-range,
+    so we merge any blobs whose horizontal intervals overlap strongly. Adjacent
+    (side-by-side) characters barely overlap in x, so they are left untouched.
+    """
+    if len(blobs) < 2:
+        return blobs
+    items = sorted(blobs, key=lambda c: c[0])
+    used = [False] * len(items)
+    merged = []
+    for i in range(len(items)):
+        if used[i]:
+            continue
+        x0, y0 = items[i][0], items[i][1]
+        x1, y1 = x0 + items[i][2], y0 + items[i][3]
+        used[i] = True
+        changed = True
+        while changed:
+            changed = False
+            for j in range(len(items)):
+                if used[j]:
+                    continue
+                jx, jy, jw, jh = items[j][0], items[j][1], items[j][2], items[j][3]
+                jx1 = jx + jw
+                ov = max(0, min(x1, jx1) - max(x0, jx))
+                narrow = max(1, min(x1 - x0, jw))
+                if ov / float(narrow) >= 0.45:          # strong x-overlap → same glyph
+                    x0, y0 = min(x0, jx), min(y0, jy)
+                    x1, y1 = max(x1, jx1), max(y1, jy + jh)
+                    used[j] = True
+                    changed = True
+        nw, nh = x1 - x0, y1 - y0
+        merged.append([x0, y0, nw, nh, x0 + nw / 2.0, y0 + nh / 2.0,
+                       strip[y0:y0 + nh, x0:x0 + nw]])
+    return sorted(merged, key=lambda c: c[0])
 
 
 def _best_run(blobs):
@@ -344,7 +391,7 @@ def segment_plate(crop_bgr):
             if (0.15 <= hh / float(SH) <= 0.98 and 0.12 <= ar <= 1.3
                     and a >= 0.08 * ww * hh and ww < 0.25 * SW):
                 blobs.append([x2, y2, ww, hh, cx, cy, strip[y2:y2 + hh, x2:x2 + ww]])
-        run = _best_run(blobs)
+        run = _best_run(_merge_fragments(blobs, strip))
         if run and len(run) >= 2:
             med_h = float(np.median([c[3] for c in run]))
             rows_out.append((r0, med_h, [c[6] for c in sorted(run, key=lambda c: c[0])]))
@@ -412,6 +459,7 @@ def segment_cropped_plate(img_bgr):
             blobs.append([x2,y2,ww,hh,float(ct[i][0]),float(ct[i][1]),
                           strip[y2:y2+hh, x2:x2+ww]])
         if not blobs: return []
+        blobs = _merge_fragments(blobs, strip)
         blobs.sort(key=lambda c: c[4]); best = []
         for seed in blobs:
             run, cur = [seed], seed
@@ -477,7 +525,7 @@ def segment_cropped_plate(img_bgr):
 # --------------------------------------------------------------------------- #
 st.set_page_config(page_title="Plate Expiry Detection", page_icon="\U0001f697")
 st.title("\U0001f697 Smart License Plate Expiration Detection")
-st.caption("detect plate \u2192 segment \u2192 HOG+SVM OCR \u2192 parse MM.YY \u2192 EXPIRED / VALID")
+st.caption("HOG + SVM OCR \u2192 parse MM.YY \u2192 EXPIRED / VALID")
 
 if not os.path.exists(MODEL_PATH):
     st.error("Model file `ocr_svm.joblib` not found. Upload it to the repo "
@@ -485,65 +533,87 @@ if not os.path.exists(MODEL_PATH):
     st.stop()
 
 model = load_model()
-file = st.file_uploader("Upload a vehicle photo or cropped plate",
-                        type=["jpg", "jpeg", "png", "bmp"])
-if file:
-    img = cv2.imdecode(np.frombuffer(file.read(), np.uint8), cv2.IMREAD_COLOR)
-    H, W = img.shape[:2]
-    box = detect_plate(img)
-    cropped_mode = False
+UPLOAD_TYPES = ["jpg", "jpeg", "png", "bmp"]
 
-    if box is None:
-        ar = W / float(H)
-        if ar > 1.5:
-            box = (0, 0, W, H)
-            cropped_mode = True
-        else:
-            st.warning("No plate could be localised in this photo.")
-            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Input")
-            st.stop()
 
-    x, y, w, h = box
-    crop = img[y:y + h, x:x + w]
-
-    c1, c2 = st.columns(2)
-    with c1:
-        if cropped_mode:
-            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Input (cropped plate)")
-        else:
-            vis = img.copy()
-            cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 4)
-            st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="Detected plate")
-    with c2:
-        st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), caption="Plate crop")
-
-    if cropped_mode:
-        top, bottom = segment_cropped_plate(crop)
-        bottom = bottom[:4]  # cap at 4 expiry digits
+# --------------------------------------------------------------------------- #
+# Shared OCR + verdict reporter (used by both modes)
+# --------------------------------------------------------------------------- #
+def report_plate(crop_bgr, use_cropped_segmenter: bool):
+    """Segment a plate crop, run OCR, parse expiry, render the verdict."""
+    if use_cropped_segmenter:
+        top, bottom = segment_cropped_plate(crop_bgr)
+        bottom = bottom[:4]
     else:
-        top, bottom = segment_plate(crop)
+        top, bottom = segment_plate(crop_bgr)
 
     if not top and not bottom:
-        st.warning("Plate found but characters could not be segmented.")
-        st.stop()
+        st.warning("Plat ditemukan, tapi karakternya tidak bisa disegmentasi.")
+        return
 
-    st.write(f"**Segmented characters** (number row: {len(top)}, expiry row: {len(bottom)})")
+    st.write(f"**Karakter tersegmentasi** "
+             f"(baris nomor: {len(top)}, baris expiry: {len(bottom)})")
     allg = top + bottom
     cols = st.columns(min(len(allg), 12) or 1)
     for c, g in zip(cols, allg):
         c.image(normalize_char(g), width=38, clamp=True)
 
     number = predict_plate_number(model, top)
-    # Expiry: paksa 4 digit (MM YY), ambil 4 pertama kalau lebih
-    exp_glyphs = bottom[:4]
-    expiry_text = "".join(predict_digit(model, g) for g in exp_glyphs)
+    expiry_text = "".join(predict_digit(model, g) for g in bottom[:4])
 
-    st.subheader(f"Plate number: `{number or '\u2014'}`")
+    st.subheader(f"Nomor plat: `{number or '\u2014'}`")
     mm, yy, expired = check_expiry(expiry_text)
-    st.write(f"Expiry text read: `{expiry_text or '\u2014'}`")
+    st.write(f"Expiry terbaca: `{expiry_text or '\u2014'}`")
     if expired is None:
-        st.info("Expiry could not be parsed (no clear MM.YY).")
+        st.info("Expiry tidak bisa di-parse (tidak ada MM.YY yang jelas).")
     elif expired:
-        st.error(f"\u274c EXPIRED \u2014 valid until {mm:02d}/{yy}")
+        st.error(f"\u274c EXPIRED \u2014 berlaku sampai {mm:02d}/{yy}")
     else:
-        st.success(f"\u2705 VALID \u2014 valid until {mm:02d}/{yy}")
+        st.success(f"\u2705 VALID \u2014 berlaku sampai {mm:02d}/{yy}")
+
+
+# --------------------------------------------------------------------------- #
+# Two explicit modes
+# --------------------------------------------------------------------------- #
+tab_full, tab_crop = st.tabs([
+    "\U0001f4f8 Foto kendaraan  \u2014  deteksi + OCR",
+    "\U0001faaa Plat ter-crop  \u2014  OCR saja",
+])
+
+# --- MODE 1: full vehicle photo → localise plate → OCR -------------------- #
+with tab_full:
+    st.caption("Unggah foto motor utuh. Plat dilokalisasi dulu (`detect_plate`), "
+               "lalu dibaca.")
+    f1 = st.file_uploader("Foto kendaraan (motor terlihat)",
+                          type=UPLOAD_TYPES, key="uploader_full")
+    if f1:
+        img = cv2.imdecode(np.frombuffer(f1.read(), np.uint8), cv2.IMREAD_COLOR)
+        box = detect_plate(img)
+        if box is None:
+            st.warning("Plat tidak bisa dilokalisasi di foto ini. Kalau gambarmu "
+                       "sebenarnya sudah berupa plat ter-crop, pakai tab "
+                       "**Plat ter-crop \u2014 OCR saja**.")
+            st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Input")
+        else:
+            x, y, w, h = box
+            crop = img[y:y + h, x:x + w]
+            c1, c2 = st.columns(2)
+            with c1:
+                vis = img.copy()
+                cv2.rectangle(vis, (x, y), (x + w, y + h), (0, 255, 0), 4)
+                st.image(cv2.cvtColor(vis, cv2.COLOR_BGR2RGB), caption="Plat terdeteksi")
+            with c2:
+                st.image(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB), caption="Crop plat")
+            report_plate(crop, use_cropped_segmenter=False)
+
+# --- MODE 2: already-cropped plate → OCR only (NO detection) -------------- #
+with tab_crop:
+    st.caption("Unggah gambar yang **sudah berupa plat** (ter-crop). Tidak ada "
+               "deteksi \u2014 langsung segmentasi + OCR, jadi tidak akan salah "
+               "mengunci ke logo atau baris expiry.")
+    f2 = st.file_uploader("Plat sudah ter-crop",
+                          type=UPLOAD_TYPES, key="uploader_crop")
+    if f2:
+        img = cv2.imdecode(np.frombuffer(f2.read(), np.uint8), cv2.IMREAD_COLOR)
+        st.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), caption="Input (plat ter-crop)")
+        report_plate(img, use_cropped_segmenter=True)
