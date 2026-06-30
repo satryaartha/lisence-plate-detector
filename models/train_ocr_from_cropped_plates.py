@@ -7,11 +7,6 @@ Train the OCR SVM using:
   2. data/raw/DatasetCharacter/  — individual character images (full class coverage)
   3. Augmentation (rotation, noise, blur, contrast) on real plate characters
 
-Run:
-  python scripts/train_ocr_from_cropped_plates.py \
-      --plates-dir data/PlateTrainingDataset \
-      --char-dir data/raw/DatasetCharacter \
-      --augment-factor 5
 """
 from __future__ import annotations
 import argparse, glob, os, re, sys
