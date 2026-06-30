@@ -29,8 +29,6 @@ Aplikasi ini mendeteksi apakah plat nomor kendaraan sudah kedaluwarsa berdasarka
 - **OCR** — pengenalan karakter dengan fitur **HOG** + classifier **SVM**
 - **Expiry parsing** — membaca MM.YY dan membandingkan dengan tanggal saat ini
 
-Tidak menggunakan deep learning / neural network — sesuai batasan proposal.
-
 ---
 
 ## 🔄 Pipeline
@@ -141,7 +139,7 @@ pip install -r requirements.txt
 streamlit run app/streamlit_app.py
 ```
 
-Buka browser ke `http://localhost:8501`, lalu upload foto plat atau kendaraan.
+Buka browser ke `https://lisence-plate-detector-2z9sxpciywtobpapsjufwm.streamlit.app/`, lalu upload foto plat atau kendaraan.
 
 ---
 
@@ -236,7 +234,3 @@ python scripts/evaluate_dataset_char.py \
 | Kenneth Howen | 2802504346 |
 
 ---
-
-## 📝 Lisensi
-
-Project ini dibuat untuk keperluan akademik (BINUS University, COMP7116001).
